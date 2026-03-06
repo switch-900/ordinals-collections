@@ -317,16 +317,21 @@ if in_legacy_not_gallery:
     else:
         print(f'FAIL|Legacy mismatch: only {len(matched)}/{len(legacy_ids)} items ({pct:.0f}%), {len(in_legacy_not_gallery)} legacy items not in gallery')
 else:
-    extra = f', gallery has {len(in_gallery_not_legacy)} extra' if in_gallery_not_legacy else ''
-    print(f'PASS|Legacy match: {len(matched)}/{len(legacy_ids)} items (100%){extra}')
-" 2>/dev/null | while IFS='|' read -r level msg; do
-    case "$level" in
-      PASS) pass "$msg" ;;
-      WARN) warn "$msg" ;;
-      FAIL) fail "$msg" ;;
-      ERROR) fail "$msg" ;;
-    esac
-  done
+    if in_gallery_not_legacy:
+        print(f'WARN|Legacy match: {len(matched)}/{len(legacy_ids)} items (100%), but gallery has {len(in_gallery_not_legacy)} extra items not in legacy')
+    else:
+        print(f'PASS|Legacy match: {len(matched)}/{len(legacy_ids)} items (100%)')
+" 2>/dev/null
+}
+
+_print_legacy_result() {
+  local level="$1" msg="$2"
+  case "$level" in
+    PASS) pass "$msg" ;;
+    WARN) warn "$msg" ;;
+    FAIL) fail "$msg" ;;
+    ERROR) fail "$msg" ;;
+  esac
 }
 
 verify_legacy_parent() {
@@ -456,6 +461,7 @@ review_pr() {
   local pr_ok=true
   local has_warnings=false
   local blocking_issues=""
+  local serious_warnings=""
 
   header "PR #${pr_number}"
 
@@ -488,11 +494,14 @@ review_pr() {
   fi
 
   # 2. CI checks
-  local checks_output
-  checks_output=$(gh pr checks "$pr_number" --repo "$REPO" 2>&1)
-  local failed_checks
-  failed_checks=$(echo "$checks_output" | grep -v "^$" | grep -v "pass" || true)
-  if [[ -n "$failed_checks" ]]; then
+  local checks_output checks_rc
+  checks_rc=0
+  checks_output=$(gh pr checks "$pr_number" --repo "$REPO" 2>&1) || checks_rc=$?
+  if echo "$checks_output" | grep -q "no checks reported"; then
+    warn "No CI checks reported (first-time contributor — may need manual approval)"
+  elif [[ $checks_rc -ne 0 ]]; then
+    local failed_checks
+    failed_checks=$(echo "$checks_output" | grep -v "^$" | grep -v "pass" || true)
     fail "CI checks failing:"
     echo "$failed_checks" | while IFS= read -r line; do info "  $line"; done
     blocking_issues="${blocking_issues}\n  - CI check failure"
@@ -514,30 +523,36 @@ review_pr() {
   info "Found ${entry_count} new collection entries"
 
   # 5. Validate each new entry
-  echo "$new_entries" | python3 -c "
-import sys, json
-for entry in json.load(sys.stdin):
-    slug = entry.get('slug', '')
-    name = entry.get('name', '')
-    entry_type = entry.get('type', '')
-    entry_id = entry.get('id', '')
-    entry_ids = ','.join(entry.get('ids', []))
-    print(f'{slug}\t{name}\t{entry_type}\t{entry_id}\t{entry_ids}')
-" | while IFS=$'\t' read -r slug name entry_type entry_id entry_ids; do
+  while IFS=$'\t' read -r slug name entry_type entry_id entry_ids; do
+    [[ "$entry_id" == "-" ]] && entry_id=""
+    [[ "$entry_ids" == "-" ]] && entry_ids=""
     echo ""
     echo -e "  ${BOLD}${slug}${RESET} — \"${name}\" (${entry_type})"
+    if [[ "$entry_type" == "gallery" ]]; then
+      info "id: ${ORD_BASE}/inscription/${entry_id}"
+    elif [[ "$entry_type" == "parent" ]]; then
+      IFS=',' read -ra _pids <<< "$entry_ids"
+      for _pid in "${_pids[@]}"; do
+        info "parent: ${ORD_BASE}/inscription/${_pid}"
+      done
+    fi
 
     # Check inscription on local ord
+    local gallery_count=0
     if [[ "$entry_type" == "gallery" ]]; then
       local ord_data
       ord_data=$(check_ord "$entry_id")
       if [[ -z "$ord_data" ]]; then
         fail "Inscription ${entry_id:0:16}... not found on local ord"
       else
-        local has_gallery
-        has_gallery=$(echo "$ord_data" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('properties',{}).get('gallery') else 'no')" 2>/dev/null)
-        if [[ "$has_gallery" == "yes" ]]; then
-          pass "Valid gallery inscription on chain"
+        gallery_count=$(echo "$ord_data" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+g=d.get('properties',{}).get('gallery',[])
+print(len(g) if isinstance(g,list) else 0)
+" 2>/dev/null)
+        if [[ "$gallery_count" -gt 0 ]]; then
+          pass "Valid gallery inscription on chain (${gallery_count} items)"
         else
           fail "Inscription exists but has no gallery property"
         fi
@@ -573,6 +588,21 @@ for entry in json.load(sys.stdin):
         warn "Name mismatch: PR=\"${name}\" vs ME=\"${me_name}\""
       fi
 
+      # Compare gallery size vs ME supply
+      if [[ "$entry_type" == "gallery" && "$gallery_count" -gt 0 && "$me_supply" != "?" ]]; then
+        if [[ "$gallery_count" -gt "$me_supply" ]]; then
+          local extra=$(( gallery_count - me_supply ))
+          warn "Gallery has ${gallery_count} items but ME supply is ${me_supply} (${extra} extra items)"
+          has_warnings=true
+          serious_warnings="${serious_warnings}\n  - Gallery has ${extra} more items than ME supply"
+        elif [[ "$gallery_count" -lt "$me_supply" ]]; then
+          local missing=$(( me_supply - gallery_count ))
+          warn "Gallery has ${gallery_count} items but ME supply is ${me_supply} (${missing} missing)"
+          has_warnings=true
+          serious_warnings="${serious_warnings}\n  - Gallery is missing ${missing} items vs ME supply"
+        fi
+      fi
+
       # Spot-check gallery items
       if [[ "$entry_type" == "gallery" ]]; then
         spot_check_gallery "$entry_id" "$slug"
@@ -599,9 +629,26 @@ for entry in json.load(sys.stdin):
     # Check legacy
     if check_legacy "$slug"; then
       info "Exists in legacy collections (migrating to new format)"
-      verify_legacy "$slug" "$entry_type" "$entry_id" "$entry_ids"
+      local legacy_output
+      legacy_output=$(verify_legacy "$slug" "$entry_type" "$entry_id" "$entry_ids")
+      while IFS='|' read -r level msg; do
+        _print_legacy_result "$level" "$msg"
+        if [[ "$level" == "WARN" || "$level" == "FAIL" ]]; then
+          has_warnings=true
+          serious_warnings="${serious_warnings}\n  - ${msg}"
+        fi
+      done <<< "$legacy_output"
     fi
-  done
+  done < <(echo "$new_entries" | python3 -c "
+import sys, json
+for entry in json.load(sys.stdin):
+    slug = entry.get('slug', '')
+    name = entry.get('name', '')
+    entry_type = entry.get('type', '')
+    entry_id = entry.get('id', '-')
+    entry_ids = ','.join(entry.get('ids', [])) or '-'
+    print(f'{slug}\t{name}\t{entry_type}\t{entry_id}\t{entry_ids}')
+")
 
   echo ""
 
@@ -609,6 +656,11 @@ for entry in json.load(sys.stdin):
   if [[ "$pr_ok" == false ]]; then
     echo -e "  ${RED}${BOLD}BLOCKED${RESET} — cannot merge:${blocking_issues}"
     return 1
+  fi
+
+  if [[ "$has_warnings" == true ]]; then
+    echo -e "  ${YELLOW}${BOLD}WARNINGS${RESET} — review carefully before merging:${serious_warnings}"
+    return 2
   fi
 
   return 0
@@ -653,10 +705,17 @@ done
 
 echo -e "${BOLD}Reviewing ${#pr_numbers[@]} PR(s) for ${REPO}${RESET}"
 
+declare -A pr_status  # "ok" or "warnings"
 mergeable_prs=()
 for pr_num in "${pr_numbers[@]}"; do
-  if review_pr "$pr_num"; then
+  rc=0
+  review_pr "$pr_num" || rc=$?
+  if [[ $rc -eq 0 ]]; then
     mergeable_prs+=("$pr_num")
+    pr_status[$pr_num]="ok"
+  elif [[ $rc -eq 2 ]]; then
+    mergeable_prs+=("$pr_num")
+    pr_status[$pr_num]="warnings"
   fi
 done
 
@@ -676,24 +735,42 @@ for pr_num in "${mergeable_prs[@]}"; do
   local_entries=$(get_new_entries "$pr_num")
   local_slugs=$(echo "$local_entries" | python3 -c "import sys,json; print(', '.join(e['slug'] for e in json.load(sys.stdin)))" 2>/dev/null)
 
-  echo -ne "Merge PR #${pr_num} (${local_title})? [y/N] "
-  read -r answer
-  if [[ "$answer" =~ ^[Yy]$ ]]; then
-    echo -n "Applying collections.json entries from PR #${pr_num}... "
-    commit_msg="Add ${local_slugs} (PR #${pr_num})"
-    commit_url=""
-    if commit_url=$(apply_collection_entries "$pr_num" "$local_entries" "$commit_msg"); then
-      echo -e "${GREEN}done${RESET}"
-      info "${commit_url}"
-      # Close the PR with a reference to the commit
-      gh pr close "$pr_num" --repo "$REPO" \
-        --comment "Merged collections.json entries via [${commit_msg}](${commit_url}). Non-data file changes were excluded." \
-        > /dev/null 2>&1
-      info "PR #${pr_num} closed — https://github.com/${REPO}/pull/${pr_num}"
-    else
-      echo -e "${RED}failed${RESET}"
-    fi
+  if [[ "${pr_status[$pr_num]}" == "warnings" ]]; then
+    echo -e "${YELLOW}PR #${pr_num} has warnings!${RESET}"
+    echo -ne "Action for PR #${pr_num} (${local_title})? [m]erge / [c]omment / [s]kip: "
   else
-    echo "Skipped PR #${pr_num}"
+    echo -ne "Action for PR #${pr_num} (${local_title})? [m]erge / [c]omment / [s]kip: "
   fi
+  read -r answer
+
+  case "$answer" in
+    m|M)
+      echo -n "Applying collections.json entries from PR #${pr_num}... "
+      commit_msg="Add ${local_slugs} (PR #${pr_num})"
+      commit_url=""
+      if commit_url=$(apply_collection_entries "$pr_num" "$local_entries" "$commit_msg"); then
+        echo -e "${GREEN}done${RESET}"
+        info "${commit_url}"
+        gh pr close "$pr_num" --repo "$REPO" \
+          --comment "Merged collections.json entries via [${commit_msg}](${commit_url}). Non-data file changes were excluded." \
+          > /dev/null 2>&1
+        info "PR #${pr_num} closed — https://github.com/${REPO}/pull/${pr_num}"
+      else
+        echo -e "${RED}failed${RESET}"
+      fi
+      ;;
+    c|C)
+      echo -ne "Enter comment for PR #${pr_num}: "
+      read -r comment_text
+      if [[ -n "$comment_text" ]]; then
+        gh pr comment "$pr_num" --repo "$REPO" --body "$comment_text" > /dev/null 2>&1
+        echo -e "${GREEN}Comment posted on PR #${pr_num}${RESET}"
+      else
+        echo "No comment entered, skipping."
+      fi
+      ;;
+    *)
+      echo "Skipped PR #${pr_num}"
+      ;;
+  esac
 done
