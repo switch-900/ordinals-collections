@@ -340,6 +340,12 @@
     "slug": "cursed-fomojis"
   },
   {
+    "name": "Cypherglyphs",
+    "type": "gallery",
+    "id": "a499248315106e680cef68d9243a07873d632d1385fa1f2de47c36eee2e25162i0",
+    "slug": "cypherglyphs"
+  },
+  {
     "name": "Dead Doges",
     "type": "parent",
     "ids": [
